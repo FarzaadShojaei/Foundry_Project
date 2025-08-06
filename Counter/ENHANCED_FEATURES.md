@@ -6,7 +6,85 @@ The EnhancedPolls contract has been significantly enhanced with advanced feature
 
 ## New Features Added
 
-### 1. Poll Templates System
+### 1. Advanced Voting Mechanisms
+
+**Purpose**: Implement sophisticated voting systems beyond simple majority voting.
+
+**Features**:
+- **Ranked Choice Voting**: Voters rank options in order of preference with elimination rounds
+- **Approval Voting**: Voters can approve multiple options simultaneously
+- **Liquid Democracy**: Dynamic delegation where voters can delegate or vote directly per poll
+
+**Usage**:
+```solidity
+// Ranked Choice Voting
+uint256[] memory rankedChoices = [0, 2, 1]; // 1st choice: option 0, 2nd: option 2, etc.
+enhancedPolls.voteRankedChoice(pollId, rankedChoices);
+
+// Approval Voting
+bool[] memory approvals = [true, false, true, false]; // Approve options 0 and 2
+enhancedPolls.voteApproval(pollId, approvals);
+
+// Liquid Democracy
+enhancedPolls.voteLiquidDemocracy(pollId, optionIndex, delegateAddress);
+```
+
+**Advanced Features**:
+- Ranked choice elimination rounds with `calculateRankedChoiceResults()`
+- Approval vote counting with multiple approvals per voter
+- Liquid democracy with per-poll delegation
+- Detailed result tracking for each voting method
+
+### 2. Snapshot Integration
+
+**Purpose**: Capture voting power at specific block heights to prevent vote manipulation.
+
+**Features**:
+- Block-height based snapshots
+- Historical balance tracking
+- Snapshot-based voting power calculation
+- Prevents last-minute token purchases for voting manipulation
+
+**Usage**:
+```solidity
+// Create snapshot for a poll
+enhancedPolls.createSnapshot(pollId);
+
+// Vote using snapshot power
+enhancedPolls.voteWithSnapshot(pollId, optionIndex);
+
+// Get snapshot voting power
+uint256 power = enhancedPolls.getSnapshotVotingPower(pollId, userAddress);
+```
+
+### 3. Multi-Token Support
+
+**Purpose**: Support multiple token types for different poll categories with weighted contributions.
+
+**Features**:
+- Category-specific token configurations
+- Token weight multipliers
+- Minimum balance requirements per token
+- Aggregated voting power from multiple tokens
+
+**Usage**:
+```solidity
+// Add token configuration for a category
+enhancedPolls.addTokenConfig(
+    PollCategory.GOVERNANCE,
+    tokenAddress,
+    1e18, // 1:1 weight multiplier
+    1000 * 1e18 // minimum balance
+);
+
+// Vote using multi-token weight
+enhancedPolls.voteMultiToken(pollId, optionIndex);
+
+// Calculate multi-token weight
+uint256 weight = enhancedPolls.calculateMultiTokenWeight(voter, category);
+```
+
+### 4. Poll Templates System
 
 **Purpose**: Pre-configured poll templates for common use cases to streamline poll creation.
 
