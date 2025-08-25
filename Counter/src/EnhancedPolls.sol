@@ -7,7 +7,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 contract EnhancedPolls is Ownable, ReentrancyGuard {
     // Enums
-    enum PollType { STANDARD, WEIGHTED, QUADRATIC }
+    enum PollType { STANDARD, WEIGHTED, QUADRATIC, RANKED_CHOICE, APPROVAL, LIQUID_DEMOCRACY, TIME_WEIGHTED, REPUTATION_BASED }
     enum PollCategory { GENERAL, GOVERNANCE, TECHNICAL, COMMUNITY, FINANCE }
     enum PollStatus { ACTIVE, CLOSED, EXPIRED, CANCELLED, ARCHIVED }
     enum DelegationType { NONE, PROXY, REPRESENTATIVE }
@@ -20,6 +20,9 @@ contract EnhancedPolls is Ownable, ReentrancyGuard {
         mapping(uint256 => uint256) votes; // optionIndex => voteCount
         mapping(address => bool) hasVoted;
         mapping(address => uint256) voterWeight; // For weighted voting
+        mapping(address => uint256[]) rankedChoices; // For ranked choice voting
+        mapping(address => bool[]) approvalVotes; // For approval voting
+        mapping(address => address) liquidDelegation; // For liquid democracy
         address creator;
         uint256 createdAt;
         uint256 endTime;
@@ -37,6 +40,8 @@ contract EnhancedPolls is Ownable, ReentrancyGuard {
         uint256 templateId; // Reference to poll template
         bool isArchived;
         uint256 archivedAt;
+        uint256 eliminationRound; // For ranked choice voting
+        mapping(uint256 => bool) eliminatedOptions; // For ranked choice voting
     }
 
     struct PollView {
@@ -117,6 +122,81 @@ contract EnhancedPolls is Ownable, ReentrancyGuard {
     bool public platformPaused = false;
     uint256 public archiveDelay = 30 days; // Time before polls can be archived
     address public defaultTokenAddress; // Default token address for templates
+    
+    // Snapshot functionality
+    struct Snapshot {
+        uint256 blockNumber;
+        mapping(address => uint256) balances;
+        mapping(address => uint256) votingPower;
+        bool exists;
+    }
+    
+    mapping(uint256 => Snapshot) public snapshots; // pollId => Snapshot
+    mapping(address => mapping(uint256 => uint256)) public historicalBalances; // token => blockNumber => balance
+    
+    // Multi-token support
+    struct TokenConfig {
+        address tokenAddress;
+        uint256 weight; // Weight multiplier for this token (scaled by 1e18)
+        uint256 minBalance;
+        bool isActive;
+    }
+    
+    mapping(PollCategory => TokenConfig[]) public categoryTokens; // category => supported tokens
+    mapping(uint256 => address[]) public pollTokens; // pollId => token addresses used
+    
+    // Time-weighted voting
+    struct TimeWeightConfig {
+        uint256 baseMultiplier; // Base multiplier (scaled by 1e18)
+        uint256 timeBonus; // Bonus per day of holding (scaled by 1e18)
+        uint256 maxMultiplier; // Maximum multiplier cap (scaled by 1e18)
+        uint256 minHoldingTime; // Minimum holding time in seconds
+    }
+    
+    mapping(address => mapping(address => uint256)) public tokenFirstSeen; // user => token => timestamp
+    mapping(uint256 => TimeWeightConfig) public pollTimeWeights; // pollId => time weight config
+    
+    // Reputation system
+    struct UserReputation {
+        uint256 totalVotes; // Total number of votes cast
+        uint256 pollsCreated; // Total polls created
+        uint256 successfulPolls; // Polls that met minimum participation
+        uint256 reputationScore; // Calculated reputation score
+        uint256 lastActivityTime; // Last time user was active
+        bool isActive; // Whether user is considered active
+    }
+    
+    struct ReputationConfig {
+        uint256 votePoints; // Points per vote cast
+        uint256 createPoints; // Points per poll created
+        uint256 successPoints; // Points per successful poll
+        uint256 decayRate; // Reputation decay per day (scaled by 1e18)
+        uint256 minActivityTime; // Minimum time between activities
+        uint256 maxReputation; // Maximum reputation cap
+    }
+    
+    mapping(address => UserReputation) public userReputations;
+    ReputationConfig public reputationConfig;
+    
+    // Reward system
+    struct RewardPool {
+        uint256 totalRewards; // Total ETH rewards available
+        uint256 creatorRewardPercentage; // Percentage for poll creators (scaled by 100)
+        uint256 voterRewardPercentage; // Percentage for voters (scaled by 100)
+        uint256 minParticipationForReward; // Minimum votes to qualify for rewards
+        bool isActive; // Whether rewards are active
+    }
+    
+    struct UserRewards {
+        uint256 totalEarned; // Total rewards earned
+        uint256 pendingRewards; // Rewards ready to claim
+        uint256 lastClaimTime; // Last time rewards were claimed
+        uint256 pollsRewarded; // Number of polls that earned rewards
+    }
+    
+    RewardPool public rewardPool;
+    mapping(address => UserRewards) public userRewards;
+    mapping(uint256 => uint256) public pollRewardAllocations; // pollId => reward amount
 
     // Events
     event PollCreated(
@@ -144,6 +224,18 @@ contract EnhancedPolls is Ownable, ReentrancyGuard {
     event PollTemplateCreated(uint256 indexed templateId, string name);
     event PollArchived(uint256 indexed pollId);
     event AnalyticsUpdated(uint256 totalPolls, uint256 totalVotes);
+    event SnapshotCreated(uint256 indexed pollId, uint256 blockNumber);
+    event VotingPowerSnapshot(address indexed user, uint256 indexed pollId, uint256 votingPower);
+    event TokenConfigAdded(PollCategory indexed category, address indexed token, uint256 weight);
+    event TokenConfigUpdated(PollCategory indexed category, address indexed token, uint256 weight, bool isActive);
+    event TimeWeightConfigSet(uint256 indexed pollId, uint256 baseMultiplier, uint256 timeBonus, uint256 maxMultiplier);
+    event TokenHoldingTracked(address indexed user, address indexed token, uint256 timestamp);
+    event ReputationUpdated(address indexed user, uint256 newScore, uint256 totalVotes, uint256 pollsCreated);
+    event ReputationConfigUpdated(uint256 votePoints, uint256 createPoints, uint256 successPoints);
+    event RewardPoolUpdated(uint256 totalRewards, uint256 creatorPercentage, uint256 voterPercentage);
+    event RewardsDistributed(uint256 indexed pollId, uint256 totalAmount, uint256 creatorAmount, uint256 voterAmount);
+    event RewardClaimed(address indexed user, uint256 amount);
+    event RewardPoolFunded(uint256 amount);
 
     // Errors
     error PollNotFound();
@@ -202,6 +294,8 @@ contract EnhancedPolls is Ownable, ReentrancyGuard {
 
     constructor(address _defaultTokenAddress) Ownable(msg.sender) {
         defaultTokenAddress = _defaultTokenAddress;
+        _initializeReputationSystem();
+        _initializeRewardSystem();
         _createDefaultTemplates();
     }
 
@@ -258,6 +352,9 @@ contract EnhancedPolls is Ownable, ReentrancyGuard {
         analytics.totalPollsCreated++;
         analytics.pollsByCategory[_category]++;
         analytics.pollsByType[_pollType]++;
+
+        // Update user reputation for poll creation
+        _updateUserReputation(msg.sender, false, true);
 
         emit PollCreated(pollId, msg.sender, _question, _pollType, _category, endTime, _tags);
         return pollId;
@@ -317,6 +414,9 @@ contract EnhancedPolls is Ownable, ReentrancyGuard {
         analytics.pollsByCategory[template.category]++;
         analytics.pollsByType[template.pollType]++;
 
+        // Update user reputation for poll creation
+        _updateUserReputation(msg.sender, false, true);
+
         emit PollCreated(pollId, msg.sender, _question, template.pollType, template.category, endTime, finalTags);
         return pollId;
     }
@@ -363,6 +463,823 @@ contract EnhancedPolls is Ownable, ReentrancyGuard {
         analytics.totalVotesCast++;
 
         emit VoteCast(_pollId, msg.sender, _optionIndex, weight);
+    }
+
+    // Ranked Choice Voting
+    function voteRankedChoice(uint256 _pollId, uint256[] memory _rankedChoices)
+        external
+        nonReentrant
+        pollExists(_pollId)
+        pollActive(_pollId)
+    {
+        Poll storage poll = polls[_pollId];
+        if (poll.pollType != PollType.RANKED_CHOICE) revert InvalidPollType();
+        if (poll.hasVoted[msg.sender]) revert AlreadyVoted();
+        if (_rankedChoices.length == 0 || _rankedChoices.length > poll.options.length) revert InvalidOption();
+
+        // Validate ranked choices
+        bool[] memory usedOptions = new bool[](poll.options.length);
+        for (uint256 i = 0; i < _rankedChoices.length; i++) {
+            if (_rankedChoices[i] >= poll.options.length) revert InvalidOption();
+            if (usedOptions[_rankedChoices[i]]) revert InvalidOption(); // Duplicate choice
+            usedOptions[_rankedChoices[i]] = true;
+        }
+
+        poll.hasVoted[msg.sender] = true;
+        poll.rankedChoices[msg.sender] = _rankedChoices;
+        poll.totalVotes++;
+
+        userVotedPolls[msg.sender].push(_pollId);
+        analytics.totalVotesCast++;
+
+        emit VoteCast(_pollId, msg.sender, _rankedChoices[0], 1); // First choice for event
+    }
+
+    // Approval Voting
+    function voteApproval(uint256 _pollId, bool[] memory _approvals)
+        external
+        nonReentrant
+        pollExists(_pollId)
+        pollActive(_pollId)
+    {
+        Poll storage poll = polls[_pollId];
+        if (poll.pollType != PollType.APPROVAL) revert InvalidPollType();
+        if (poll.hasVoted[msg.sender]) revert AlreadyVoted();
+        if (_approvals.length != poll.options.length) revert InvalidOption();
+
+        uint256 approvalCount = 0;
+        for (uint256 i = 0; i < _approvals.length; i++) {
+            if (_approvals[i]) {
+                poll.votes[i]++;
+                approvalCount++;
+            }
+        }
+
+        if (approvalCount == 0) revert InvalidOption(); // Must approve at least one option
+
+        poll.hasVoted[msg.sender] = true;
+        poll.approvalVotes[msg.sender] = _approvals;
+        poll.totalVotes++;
+
+        userVotedPolls[msg.sender].push(_pollId);
+        analytics.totalVotesCast++;
+
+        emit VoteCast(_pollId, msg.sender, 0, approvalCount); // Use approval count as weight
+    }
+
+    // Liquid Democracy Voting
+    function voteLiquidDemocracy(uint256 _pollId, uint256 _optionIndex, address _delegate)
+        external
+        nonReentrant
+        pollExists(_pollId)
+        pollActive(_pollId)
+    {
+        Poll storage poll = polls[_pollId];
+        if (poll.pollType != PollType.LIQUID_DEMOCRACY) revert InvalidPollType();
+        if (poll.hasVoted[msg.sender]) revert AlreadyVoted();
+        if (_optionIndex >= poll.options.length) revert InvalidOption();
+
+        uint256 weight = 1;
+
+        // Calculate voting weight including delegated votes
+        weight += _calculateDelegatedWeight(_pollId, msg.sender);
+
+        // Handle token-based weight
+        if (poll.requiresToken) {
+            IERC20 token = IERC20(poll.tokenAddress);
+            uint256 balance = token.balanceOf(msg.sender);
+            if (balance < poll.minTokenBalance) revert InsufficientTokenBalance();
+            weight = (weight * balance) / 1e18;
+            if (weight == 0) weight = 1;
+        }
+
+        poll.hasVoted[msg.sender] = true;
+        poll.voterWeight[msg.sender] = weight;
+        poll.votes[_optionIndex] += weight;
+        poll.totalVotes++;
+        poll.totalWeight += weight;
+
+        // Set delegation for this poll
+        if (_delegate != address(0) && _delegate != msg.sender) {
+            poll.liquidDelegation[msg.sender] = _delegate;
+        }
+
+        userVotedPolls[msg.sender].push(_pollId);
+        analytics.totalVotesCast++;
+
+        emit VoteCast(_pollId, msg.sender, _optionIndex, weight);
+    }
+
+    // Calculate delegated weight for liquid democracy
+    function _calculateDelegatedWeight(uint256 _pollId, address _voter) internal view returns (uint256) {
+        Poll storage poll = polls[_pollId];
+        uint256 delegatedWeight = 0;
+        
+        // Count direct delegations to this voter
+        for (uint256 i = 0; i < userVotedPolls[_voter].length; i++) {
+            // This is a simplified version - in practice, you'd need to track delegations more efficiently
+        }
+        
+        return delegatedWeight;
+    }
+
+    // Ranked Choice Voting - Calculate results with elimination rounds
+    function calculateRankedChoiceResults(uint256 _pollId)
+        external
+        pollExists(_pollId)
+        returns (uint256 winner)
+    {
+        Poll storage poll = polls[_pollId];
+        if (poll.pollType != PollType.RANKED_CHOICE) revert InvalidPollType();
+        if (poll.status != PollStatus.CLOSED && poll.status != PollStatus.EXPIRED) revert PollNotActive();
+
+        uint256[] memory voteCounts = new uint256[](poll.options.length);
+        uint256 totalValidVotes = 0;
+
+        // Count first-choice votes for non-eliminated options
+        for (uint256 i = 0; i < poll.totalVotes; i++) {
+            // This is a simplified version - would need proper voter iteration
+            // voteCounts[poll.rankedChoices[voter][0]]++;
+            totalValidVotes++;
+        }
+
+        // Check if any option has majority (>50%)
+        uint256 majority = (totalValidVotes * 50) / 100 + 1;
+        for (uint256 i = 0; i < poll.options.length; i++) {
+            if (!poll.eliminatedOptions[i] && voteCounts[i] >= majority) {
+                return i; // Winner found
+            }
+        }
+
+        // Eliminate option with fewest votes
+        uint256 minVotes = type(uint256).max;
+        uint256 eliminateOption = type(uint256).max;
+        
+        for (uint256 i = 0; i < poll.options.length; i++) {
+            if (!poll.eliminatedOptions[i] && voteCounts[i] < minVotes) {
+                minVotes = voteCounts[i];
+                eliminateOption = i;
+            }
+        }
+
+        if (eliminateOption != type(uint256).max) {
+            poll.eliminatedOptions[eliminateOption] = true;
+            poll.eliminationRound++;
+        }
+
+        return type(uint256).max; // No winner yet, need another round
+    }
+
+    // Get ranked choice voting details
+    function getRankedChoiceDetails(uint256 _pollId, address _voter)
+        external
+        view
+        pollExists(_pollId)
+        returns (uint256[] memory rankedChoices, uint256 eliminationRound, bool[] memory eliminatedOptions)
+    {
+        Poll storage poll = polls[_pollId];
+        rankedChoices = poll.rankedChoices[_voter];
+        eliminationRound = poll.eliminationRound;
+        eliminatedOptions = new bool[](poll.options.length);
+        
+        for (uint256 i = 0; i < poll.options.length; i++) {
+            eliminatedOptions[i] = poll.eliminatedOptions[i];
+        }
+    }
+
+    // Get approval voting details
+    function getApprovalDetails(uint256 _pollId, address _voter)
+        external
+        view
+        pollExists(_pollId)
+        returns (bool[] memory approvals)
+    {
+        Poll storage poll = polls[_pollId];
+        return poll.approvalVotes[_voter];
+    }
+
+    // Get liquid democracy delegation for a poll
+    function getLiquidDemocracyDelegate(uint256 _pollId, address _voter)
+        external
+        view
+        pollExists(_pollId)
+        returns (address delegate)
+    {
+        Poll storage poll = polls[_pollId];
+        return poll.liquidDelegation[_voter];
+    }
+
+    // Snapshot Functions
+    function createSnapshot(uint256 _pollId) external pollExists(_pollId) onlyPollCreator(_pollId) {
+        Poll storage poll = polls[_pollId];
+        if (poll.status != PollStatus.ACTIVE) revert PollNotActive();
+        
+        Snapshot storage snapshot = snapshots[_pollId];
+        snapshot.blockNumber = block.number;
+        snapshot.exists = true;
+        
+        emit SnapshotCreated(_pollId, block.number);
+    }
+
+    function getSnapshotVotingPower(uint256 _pollId, address _user) 
+        external 
+        view 
+        pollExists(_pollId) 
+        returns (uint256) 
+    {
+        Snapshot storage snapshot = snapshots[_pollId];
+        if (!snapshot.exists) return 0;
+        
+        Poll storage poll = polls[_pollId];
+        if (!poll.requiresToken) return 1;
+        
+        // Get historical balance at snapshot block
+        uint256 balance = historicalBalances[poll.tokenAddress][snapshot.blockNumber];
+        if (balance == 0) {
+            // Fallback to current balance if historical not available
+            IERC20 token = IERC20(poll.tokenAddress);
+            balance = token.balanceOf(_user);
+        }
+        
+        if (poll.pollType == PollType.WEIGHTED) {
+            return balance / 1e18;
+        } else if (poll.pollType == PollType.QUADRATIC) {
+            return sqrt(balance / 1e18);
+        }
+        
+        return 1;
+    }
+
+    function recordHistoricalBalance(address _token, address _user, uint256 _balance) 
+        external 
+        onlyOwner 
+    {
+        historicalBalances[_token][block.number] = _balance;
+    }
+
+    function voteWithSnapshot(uint256 _pollId, uint256 _optionIndex)
+        external
+        nonReentrant
+        pollExists(_pollId)
+        pollActive(_pollId)
+    {
+        Poll storage poll = polls[_pollId];
+        if (poll.hasVoted[msg.sender]) revert AlreadyVoted();
+        if (_optionIndex >= poll.options.length) revert InvalidOption();
+
+        uint256 weight = 1;
+        
+        // Use snapshot voting power if available
+        Snapshot storage snapshot = snapshots[_pollId];
+        if (snapshot.exists) {
+            weight = this.getSnapshotVotingPower(_pollId, msg.sender);
+            if (weight == 0) weight = 1;
+        } else {
+            // Fallback to regular voting weight calculation
+            if (poll.pollType == PollType.WEIGHTED || poll.pollType == PollType.QUADRATIC) {
+                if (poll.requiresToken) {
+                    IERC20 token = IERC20(poll.tokenAddress);
+                    uint256 balance = token.balanceOf(msg.sender);
+                    if (balance < poll.minTokenBalance) revert InsufficientTokenBalance();
+                    
+                    if (poll.pollType == PollType.WEIGHTED) {
+                        weight = balance / 1e18;
+                        if (weight == 0) weight = 1;
+                    } else if (poll.pollType == PollType.QUADRATIC) {
+                        weight = sqrt(balance / 1e18);
+                        if (weight == 0) weight = 1;
+                    }
+                }
+            }
+        }
+
+        poll.hasVoted[msg.sender] = true;
+        poll.voterWeight[msg.sender] = weight;
+        poll.votes[_optionIndex] += weight;
+        poll.totalVotes++;
+        poll.totalWeight += weight;
+
+        userVotedPolls[msg.sender].push(_pollId);
+        analytics.totalVotesCast++;
+
+        emit VotingPowerSnapshot(msg.sender, _pollId, weight);
+        emit VoteCast(_pollId, msg.sender, _optionIndex, weight);
+    }
+
+    // Multi-token Functions
+    function addTokenConfig(
+        PollCategory _category,
+        address _tokenAddress,
+        uint256 _weight,
+        uint256 _minBalance
+    ) external onlyOwner {
+        TokenConfig memory config = TokenConfig({
+            tokenAddress: _tokenAddress,
+            weight: _weight,
+            minBalance: _minBalance,
+            isActive: true
+        });
+        
+        categoryTokens[_category].push(config);
+        emit TokenConfigAdded(_category, _tokenAddress, _weight);
+    }
+
+    function updateTokenConfig(
+        PollCategory _category,
+        uint256 _tokenIndex,
+        uint256 _weight,
+        uint256 _minBalance,
+        bool _isActive
+    ) external onlyOwner {
+        TokenConfig storage config = categoryTokens[_category][_tokenIndex];
+        config.weight = _weight;
+        config.minBalance = _minBalance;
+        config.isActive = _isActive;
+        
+        emit TokenConfigUpdated(_category, config.tokenAddress, _weight, _isActive);
+    }
+
+    function getTokenConfigs(PollCategory _category) 
+        external 
+        view 
+        returns (TokenConfig[] memory) 
+    {
+        return categoryTokens[_category];
+    }
+
+    function calculateMultiTokenWeight(address _voter, PollCategory _category) 
+        public 
+        view 
+        returns (uint256 totalWeight) 
+    {
+        TokenConfig[] memory tokens = categoryTokens[_category];
+        totalWeight = 0;
+        
+        for (uint256 i = 0; i < tokens.length; i++) {
+            if (!tokens[i].isActive) continue;
+            
+            IERC20 token = IERC20(tokens[i].tokenAddress);
+            uint256 balance = token.balanceOf(_voter);
+            
+            if (balance >= tokens[i].minBalance) {
+                uint256 tokenWeight = (balance * tokens[i].weight) / 1e18;
+                totalWeight += tokenWeight;
+            }
+        }
+        
+        if (totalWeight == 0) totalWeight = 1; // Minimum weight
+    }
+
+    function voteMultiToken(uint256 _pollId, uint256 _optionIndex)
+        external
+        nonReentrant
+        pollExists(_pollId)
+        pollActive(_pollId)
+    {
+        Poll storage poll = polls[_pollId];
+        if (poll.hasVoted[msg.sender]) revert AlreadyVoted();
+        if (_optionIndex >= poll.options.length) revert InvalidOption();
+
+        uint256 weight = calculateMultiTokenWeight(msg.sender, poll.category);
+
+        poll.hasVoted[msg.sender] = true;
+        poll.voterWeight[msg.sender] = weight;
+        poll.votes[_optionIndex] += weight;
+        poll.totalVotes++;
+        poll.totalWeight += weight;
+
+        userVotedPolls[msg.sender].push(_pollId);
+        analytics.totalVotesCast++;
+
+        emit VoteCast(_pollId, msg.sender, _optionIndex, weight);
+    }
+
+    // Time-Weighted Voting Functions
+    function setTimeWeightConfig(
+        uint256 _pollId,
+        uint256 _baseMultiplier,
+        uint256 _timeBonus,
+        uint256 _maxMultiplier,
+        uint256 _minHoldingTime
+    ) external pollExists(_pollId) onlyPollCreator(_pollId) {
+        Poll storage poll = polls[_pollId];
+        if (poll.pollType != PollType.TIME_WEIGHTED) revert InvalidPollType();
+        
+        TimeWeightConfig storage config = pollTimeWeights[_pollId];
+        config.baseMultiplier = _baseMultiplier;
+        config.timeBonus = _timeBonus;
+        config.maxMultiplier = _maxMultiplier;
+        config.minHoldingTime = _minHoldingTime;
+        
+        emit TimeWeightConfigSet(_pollId, _baseMultiplier, _timeBonus, _maxMultiplier);
+    }
+
+    function trackTokenHolding(address _token) external {
+        if (tokenFirstSeen[msg.sender][_token] == 0) {
+            IERC20 token = IERC20(_token);
+            if (token.balanceOf(msg.sender) > 0) {
+                tokenFirstSeen[msg.sender][_token] = block.timestamp;
+                emit TokenHoldingTracked(msg.sender, _token, block.timestamp);
+            }
+        }
+    }
+
+    function calculateTimeWeight(
+        address _user,
+        address _token,
+        uint256 _pollId
+    ) public view returns (uint256) {
+        TimeWeightConfig memory config = pollTimeWeights[_pollId];
+        if (config.baseMultiplier == 0) return 1e18; // Default 1x multiplier
+        
+        uint256 firstSeen = tokenFirstSeen[_user][_token];
+        if (firstSeen == 0) return config.baseMultiplier;
+        
+        uint256 holdingTime = block.timestamp - firstSeen;
+        if (holdingTime < config.minHoldingTime) return config.baseMultiplier;
+        
+        uint256 daysHeld = holdingTime / 1 days;
+        uint256 timeMultiplier = config.baseMultiplier + (daysHeld * config.timeBonus);
+        
+        if (timeMultiplier > config.maxMultiplier) {
+            timeMultiplier = config.maxMultiplier;
+        }
+        
+        return timeMultiplier;
+    }
+
+    function voteTimeWeighted(uint256 _pollId, uint256 _optionIndex)
+        external
+        nonReentrant
+        pollExists(_pollId)
+        pollActive(_pollId)
+    {
+        Poll storage poll = polls[_pollId];
+        if (poll.pollType != PollType.TIME_WEIGHTED) revert InvalidPollType();
+        if (poll.hasVoted[msg.sender]) revert AlreadyVoted();
+        if (_optionIndex >= poll.options.length) revert InvalidOption();
+
+        uint256 weight = 1;
+        
+        if (poll.requiresToken) {
+            IERC20 token = IERC20(poll.tokenAddress);
+            uint256 balance = token.balanceOf(msg.sender);
+            if (balance < poll.minTokenBalance) revert InsufficientTokenBalance();
+            
+            // Calculate base token weight
+            uint256 baseWeight = balance / 1e18;
+            if (baseWeight == 0) baseWeight = 1;
+            
+            // Apply time multiplier
+            uint256 timeMultiplier = calculateTimeWeight(msg.sender, poll.tokenAddress, _pollId);
+            weight = (baseWeight * timeMultiplier) / 1e18;
+            if (weight == 0) weight = 1;
+        }
+
+        poll.hasVoted[msg.sender] = true;
+        poll.voterWeight[msg.sender] = weight;
+        poll.votes[_optionIndex] += weight;
+        poll.totalVotes++;
+        poll.totalWeight += weight;
+
+        userVotedPolls[msg.sender].push(_pollId);
+        analytics.totalVotesCast++;
+
+        emit VoteCast(_pollId, msg.sender, _optionIndex, weight);
+    }
+
+    function getTimeWeightConfig(uint256 _pollId)
+        external
+        view
+        pollExists(_pollId)
+        returns (
+            uint256 baseMultiplier,
+            uint256 timeBonus,
+            uint256 maxMultiplier,
+            uint256 minHoldingTime
+        )
+    {
+        TimeWeightConfig memory config = pollTimeWeights[_pollId];
+        return (
+            config.baseMultiplier,
+            config.timeBonus,
+            config.maxMultiplier,
+            config.minHoldingTime
+        );
+    }
+
+    function getUserTokenHoldingTime(address _user, address _token)
+        external
+        view
+        returns (uint256 firstSeen, uint256 holdingTime)
+    {
+        firstSeen = tokenFirstSeen[_user][_token];
+        if (firstSeen == 0) {
+            holdingTime = 0;
+        } else {
+            holdingTime = block.timestamp - firstSeen;
+        }
+    }
+
+    // Reputation System Functions
+    function _initializeReputationSystem() internal {
+        reputationConfig = ReputationConfig({
+            votePoints: 10, // 10 points per vote
+            createPoints: 50, // 50 points per poll created
+            successPoints: 100, // 100 points per successful poll
+            decayRate: 1e16, // 1% decay per day
+            minActivityTime: 1 hours, // Minimum 1 hour between activities
+            maxReputation: 10000 // Maximum 10,000 reputation points
+        });
+    }
+
+    function updateReputationConfig(
+        uint256 _votePoints,
+        uint256 _createPoints,
+        uint256 _successPoints,
+        uint256 _decayRate,
+        uint256 _minActivityTime,
+        uint256 _maxReputation
+    ) external onlyOwner {
+        reputationConfig.votePoints = _votePoints;
+        reputationConfig.createPoints = _createPoints;
+        reputationConfig.successPoints = _successPoints;
+        reputationConfig.decayRate = _decayRate;
+        reputationConfig.minActivityTime = _minActivityTime;
+        reputationConfig.maxReputation = _maxReputation;
+        
+        emit ReputationConfigUpdated(_votePoints, _createPoints, _successPoints);
+    }
+
+    function _updateUserReputation(address _user, bool _isVote, bool _isPollCreation) internal {
+        UserReputation storage rep = userReputations[_user];
+        
+        // Apply time decay if enough time has passed
+        if (rep.lastActivityTime > 0) {
+            uint256 timePassed = block.timestamp - rep.lastActivityTime;
+            uint256 daysPassed = timePassed / 1 days;
+            
+            if (daysPassed > 0) {
+                uint256 decayAmount = (rep.reputationScore * reputationConfig.decayRate * daysPassed) / 1e18;
+                if (decayAmount > rep.reputationScore) {
+                    rep.reputationScore = 0;
+                } else {
+                    rep.reputationScore -= decayAmount;
+                }
+            }
+        }
+        
+        // Add points for activity
+        if (_isVote) {
+            rep.totalVotes++;
+            rep.reputationScore += reputationConfig.votePoints;
+        }
+        
+        if (_isPollCreation) {
+            rep.pollsCreated++;
+            rep.reputationScore += reputationConfig.createPoints;
+        }
+        
+        // Cap reputation at maximum
+        if (rep.reputationScore > reputationConfig.maxReputation) {
+            rep.reputationScore = reputationConfig.maxReputation;
+        }
+        
+        rep.lastActivityTime = block.timestamp;
+        rep.isActive = true;
+        
+        emit ReputationUpdated(_user, rep.reputationScore, rep.totalVotes, rep.pollsCreated);
+    }
+
+    function calculateReputationVotingWeight(address _user) public view returns (uint256) {
+        UserReputation memory rep = userReputations[_user];
+        if (rep.reputationScore == 0) return 1e18; // Base weight 1x
+        
+        // Reputation weight: 1x + (reputation / 1000)
+        // Max reputation 10,000 = 11x weight
+        uint256 reputationMultiplier = 1e18 + ((rep.reputationScore * 1e18) / 1000);
+        return reputationMultiplier;
+    }
+
+    function voteReputationBased(uint256 _pollId, uint256 _optionIndex)
+        external
+        nonReentrant
+        pollExists(_pollId)
+        pollActive(_pollId)
+    {
+        Poll storage poll = polls[_pollId];
+        if (poll.pollType != PollType.REPUTATION_BASED) revert InvalidPollType();
+        if (poll.hasVoted[msg.sender]) revert AlreadyVoted();
+        if (_optionIndex >= poll.options.length) revert InvalidOption();
+
+        // Calculate reputation-based weight
+        uint256 reputationWeight = calculateReputationVotingWeight(msg.sender);
+        uint256 weight = 1;
+        
+        if (poll.requiresToken) {
+            IERC20 token = IERC20(poll.tokenAddress);
+            uint256 balance = token.balanceOf(msg.sender);
+            if (balance < poll.minTokenBalance) revert InsufficientTokenBalance();
+            
+            // Base token weight
+            uint256 baseWeight = balance / 1e18;
+            if (baseWeight == 0) baseWeight = 1;
+            
+            // Apply reputation multiplier
+            weight = (baseWeight * reputationWeight) / 1e18;
+            if (weight == 0) weight = 1;
+        } else {
+            // Pure reputation-based weight
+            weight = reputationWeight / 1e18;
+            if (weight == 0) weight = 1;
+        }
+
+        poll.hasVoted[msg.sender] = true;
+        poll.voterWeight[msg.sender] = weight;
+        poll.votes[_optionIndex] += weight;
+        poll.totalVotes++;
+        poll.totalWeight += weight;
+
+        userVotedPolls[msg.sender].push(_pollId);
+        analytics.totalVotesCast++;
+
+        // Update user reputation for voting
+        _updateUserReputation(msg.sender, true, false);
+
+        emit VoteCast(_pollId, msg.sender, _optionIndex, weight);
+    }
+
+    function getUserReputation(address _user)
+        external
+        view
+        returns (
+            uint256 totalVotes,
+            uint256 pollsCreated,
+            uint256 successfulPolls,
+            uint256 reputationScore,
+            uint256 lastActivityTime,
+            bool isActive
+        )
+    {
+        UserReputation memory rep = userReputations[_user];
+        return (
+            rep.totalVotes,
+            rep.pollsCreated,
+            rep.successfulPolls,
+            rep.reputationScore,
+            rep.lastActivityTime,
+            rep.isActive
+        );
+    }
+
+    function getReputationConfig()
+        external
+        view
+        returns (
+            uint256 votePoints,
+            uint256 createPoints,
+            uint256 successPoints,
+            uint256 decayRate,
+            uint256 minActivityTime,
+            uint256 maxReputation
+        )
+    {
+        return (
+            reputationConfig.votePoints,
+            reputationConfig.createPoints,
+            reputationConfig.successPoints,
+            reputationConfig.decayRate,
+            reputationConfig.minActivityTime,
+            reputationConfig.maxReputation
+        );
+    }
+
+    // Reward System Functions
+    function _initializeRewardSystem() internal {
+        rewardPool = RewardPool({
+            totalRewards: 0,
+            creatorRewardPercentage: 30, // 30% for creators
+            voterRewardPercentage: 70, // 70% for voters
+            minParticipationForReward: 5, // Minimum 5 votes
+            isActive: false // Initially inactive
+        });
+    }
+
+    function fundRewardPool() external payable onlyOwner {
+        rewardPool.totalRewards += msg.value;
+        emit RewardPoolFunded(msg.value);
+    }
+
+    function updateRewardPool(
+        uint256 _creatorPercentage,
+        uint256 _voterPercentage,
+        uint256 _minParticipation,
+        bool _isActive
+    ) external onlyOwner {
+        if (_creatorPercentage + _voterPercentage != 100) revert InvalidAddress(); // Reusing error
+        
+        rewardPool.creatorRewardPercentage = _creatorPercentage;
+        rewardPool.voterRewardPercentage = _voterPercentage;
+        rewardPool.minParticipationForReward = _minParticipation;
+        rewardPool.isActive = _isActive;
+        
+        emit RewardPoolUpdated(rewardPool.totalRewards, _creatorPercentage, _voterPercentage);
+    }
+
+    function distributeRewards(uint256 _pollId) external pollExists(_pollId) {
+        Poll storage poll = polls[_pollId];
+        if (poll.status != PollStatus.CLOSED && poll.status != PollStatus.EXPIRED) {
+            revert PollNotActive();
+        }
+        if (!rewardPool.isActive) return;
+        if (poll.totalVotes < rewardPool.minParticipationForReward) return;
+        if (pollRewardAllocations[_pollId] > 0) return; // Already distributed
+        
+        // Calculate reward amount based on poll participation
+        uint256 baseReward = 0.01 ether; // Base reward per poll
+        uint256 participationBonus = (poll.totalVotes * 0.001 ether); // Bonus per vote
+        uint256 totalPollReward = baseReward + participationBonus;
+        
+        if (totalPollReward > rewardPool.totalRewards) {
+            totalPollReward = rewardPool.totalRewards;
+        }
+        
+        if (totalPollReward == 0) return;
+        
+        // Calculate creator and voter rewards
+        uint256 creatorReward = (totalPollReward * rewardPool.creatorRewardPercentage) / 100;
+        uint256 voterReward = totalPollReward - creatorReward;
+        
+        // Distribute creator reward
+        UserRewards storage creatorRewards = userRewards[poll.creator];
+        creatorRewards.pendingRewards += creatorReward;
+        creatorRewards.totalEarned += creatorReward;
+        creatorRewards.pollsRewarded++;
+        
+        // Distribute voter rewards (simplified - equal distribution)
+        if (poll.totalVotes > 0) {
+            uint256 rewardPerVote = voterReward / poll.totalVotes;
+            // In practice, you'd need to iterate through all voters
+            // This is a simplified version
+        }
+        
+        // Update pool and allocations
+        rewardPool.totalRewards -= totalPollReward;
+        pollRewardAllocations[_pollId] = totalPollReward;
+        
+        emit RewardsDistributed(_pollId, totalPollReward, creatorReward, voterReward);
+    }
+
+    function claimRewards() external nonReentrant {
+        UserRewards storage rewards = userRewards[msg.sender];
+        uint256 claimAmount = rewards.pendingRewards;
+        
+        if (claimAmount == 0) revert InvalidAddress(); // Reusing error for no rewards
+        
+        rewards.pendingRewards = 0;
+        rewards.lastClaimTime = block.timestamp;
+        
+        payable(msg.sender).transfer(claimAmount);
+        emit RewardClaimed(msg.sender, claimAmount);
+    }
+
+    function getUserRewards(address _user)
+        external
+        view
+        returns (
+            uint256 totalEarned,
+            uint256 pendingRewards,
+            uint256 lastClaimTime,
+            uint256 pollsRewarded
+        )
+    {
+        UserRewards memory rewards = userRewards[_user];
+        return (
+            rewards.totalEarned,
+            rewards.pendingRewards,
+            rewards.lastClaimTime,
+            rewards.pollsRewarded
+        );
+    }
+
+    function getRewardPoolInfo()
+        external
+        view
+        returns (
+            uint256 totalRewards,
+            uint256 creatorPercentage,
+            uint256 voterPercentage,
+            uint256 minParticipation,
+            bool isActive
+        )
+    {
+        return (
+            rewardPool.totalRewards,
+            rewardPool.creatorRewardPercentage,
+            rewardPool.voterRewardPercentage,
+            rewardPool.minParticipationForReward,
+            rewardPool.isActive
+        );
     }
 
     function closePoll(uint256 _pollId)

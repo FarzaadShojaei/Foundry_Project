@@ -816,4 +816,581 @@ contract EnhancedPollsTest is Test {
         (delegate, delegationType, delegatedAt, totalDelegatedWeight, isActive) = enhancedPolls.getDelegationInfo(voter3);
         assertFalse(isActive);
     }
+
+    function test_RankedChoiceVoting() public {
+        vm.startPrank(owner);
+
+        string[] memory options = new string[](4);
+        options[0] = "Alice";
+        options[1] = "Bob";
+        options[2] = "Charlie";
+        options[3] = "Diana";
+
+        string[] memory tags = new string[](1);
+        tags[0] = "election";
+
+        uint256 pollId = enhancedPolls.createPoll(
+            "Who should be the new leader?",
+            options,
+            7 days,
+            EnhancedPolls.PollType.RANKED_CHOICE,
+            EnhancedPolls.PollCategory.GOVERNANCE,
+            0,
+            address(0),
+            0,
+            "Ranked choice voting test",
+            tags
+        );
+
+        vm.stopPrank();
+
+        // Vote with ranked choices
+        vm.prank(voter1);
+        uint256[] memory choices1 = new uint256[](3);
+        choices1[0] = 0; // Alice first
+        choices1[1] = 2; // Charlie second
+        choices1[2] = 1; // Bob third
+        enhancedPolls.voteRankedChoice(pollId, choices1);
+
+        vm.prank(voter2);
+        uint256[] memory choices2 = new uint256[](2);
+        choices2[0] = 1; // Bob first
+        choices2[1] = 0; // Alice second
+        enhancedPolls.voteRankedChoice(pollId, choices2);
+
+        // Check ranked choice details
+        (uint256[] memory rankedChoices, uint256 eliminationRound, bool[] memory eliminatedOptions) = 
+            enhancedPolls.getRankedChoiceDetails(pollId, voter1);
+        
+        assertEq(rankedChoices.length, 3);
+        assertEq(rankedChoices[0], 0); // Alice
+        assertEq(rankedChoices[1], 2); // Charlie
+        assertEq(rankedChoices[2], 1); // Bob
+        assertEq(eliminationRound, 0);
+    }
+
+    function test_ApprovalVoting() public {
+        vm.startPrank(owner);
+
+        string[] memory options = new string[](4);
+        options[0] = "Option A";
+        options[1] = "Option B";
+        options[2] = "Option C";
+        options[3] = "Option D";
+
+        string[] memory tags = new string[](1);
+        tags[0] = "approval";
+
+        uint256 pollId = enhancedPolls.createPoll(
+            "Which options do you approve?",
+            options,
+            7 days,
+            EnhancedPolls.PollType.APPROVAL,
+            EnhancedPolls.PollCategory.GENERAL,
+            0,
+            address(0),
+            0,
+            "Approval voting test",
+            tags
+        );
+
+        vm.stopPrank();
+
+        // Vote with approvals
+        vm.prank(voter1);
+        bool[] memory approvals1 = new bool[](4);
+        approvals1[0] = true;  // Approve A
+        approvals1[1] = false; // Don't approve B
+        approvals1[2] = true;  // Approve C
+        approvals1[3] = false; // Don't approve D
+        enhancedPolls.voteApproval(pollId, approvals1);
+
+        vm.prank(voter2);
+        bool[] memory approvals2 = new bool[](4);
+        approvals2[0] = true;  // Approve A
+        approvals2[1] = true;  // Approve B
+        approvals2[2] = false; // Don't approve C
+        approvals2[3] = true;  // Approve D
+        enhancedPolls.voteApproval(pollId, approvals2);
+
+        // Check results
+        (uint256[] memory votes, uint256 totalVotes, uint256 totalWeight) = enhancedPolls.getPollResults(pollId);
+        assertEq(votes[0], 2); // Option A: 2 approvals
+        assertEq(votes[1], 1); // Option B: 1 approval
+        assertEq(votes[2], 1); // Option C: 1 approval
+        assertEq(votes[3], 1); // Option D: 1 approval
+        assertEq(totalVotes, 2); // 2 people voted
+
+        // Check approval details
+        bool[] memory voter1Approvals = enhancedPolls.getApprovalDetails(pollId, voter1);
+        assertTrue(voter1Approvals[0]); // Approved A
+        assertFalse(voter1Approvals[1]); // Didn't approve B
+        assertTrue(voter1Approvals[2]); // Approved C
+        assertFalse(voter1Approvals[3]); // Didn't approve D
+    }
+
+    function test_LiquidDemocracy() public {
+        vm.startPrank(owner);
+
+        string[] memory options = new string[](2);
+        options[0] = "Yes";
+        options[1] = "No";
+
+        string[] memory tags = new string[](1);
+        tags[0] = "liquid";
+
+        uint256 pollId = enhancedPolls.createPoll(
+            "Liquid democracy test",
+            options,
+            7 days,
+            EnhancedPolls.PollType.LIQUID_DEMOCRACY,
+            EnhancedPolls.PollCategory.GOVERNANCE,
+            0,
+            address(0),
+            0,
+            "Testing liquid democracy",
+            tags
+        );
+
+        vm.stopPrank();
+
+        // Vote with liquid democracy
+        vm.prank(voter1);
+        enhancedPolls.voteLiquidDemocracy(pollId, 0, delegate1);
+
+        // Check liquid democracy delegation
+        address liquidDelegate = enhancedPolls.getLiquidDemocracyDelegate(pollId, voter1);
+        assertEq(liquidDelegate, delegate1);
+
+        // Check results
+        (uint256[] memory votes, uint256 totalVotes, uint256 totalWeight) = enhancedPolls.getPollResults(pollId);
+        assertEq(votes[0], 1); // voter1 voted for option 0
+        assertEq(totalVotes, 1);
+    }
+
+    function test_SnapshotVoting() public {
+        vm.startPrank(owner);
+
+        string[] memory options = new string[](2);
+        options[0] = "Yes";
+        options[1] = "No";
+
+        string[] memory tags = new string[](1);
+        tags[0] = "snapshot";
+
+        uint256 pollId = enhancedPolls.createPoll(
+            "Snapshot voting test",
+            options,
+            7 days,
+            EnhancedPolls.PollType.WEIGHTED,
+            EnhancedPolls.PollCategory.GOVERNANCE,
+            0,
+            address(governanceToken),
+            1000 * 1e18,
+            "Testing snapshot functionality",
+            tags
+        );
+
+        // Create snapshot
+        enhancedPolls.createSnapshot(pollId);
+
+        vm.stopPrank();
+
+        // Vote with snapshot
+        vm.prank(voter1);
+        enhancedPolls.voteWithSnapshot(pollId, 0);
+
+        // Check snapshot voting power
+        uint256 votingPower = enhancedPolls.getSnapshotVotingPower(pollId, voter1);
+        assertEq(votingPower, 10000); // voter1's token balance / 1e18
+    }
+
+    function test_MultiTokenVoting() public {
+        vm.startPrank(owner);
+
+        // Add token configuration for governance category
+        enhancedPolls.addTokenConfig(
+            EnhancedPolls.PollCategory.GOVERNANCE,
+            address(governanceToken),
+            1e18, // 1:1 weight
+            1000 * 1e18 // min 1000 tokens
+        );
+
+        string[] memory options = new string[](2);
+        options[0] = "Yes";
+        options[1] = "No";
+
+        string[] memory tags = new string[](1);
+        tags[0] = "multitoken";
+
+        uint256 pollId = enhancedPolls.createPoll(
+            "Multi-token voting test",
+            options,
+            7 days,
+            EnhancedPolls.PollType.STANDARD,
+            EnhancedPolls.PollCategory.GOVERNANCE,
+            0,
+            address(0),
+            0,
+            "Testing multi-token functionality",
+            tags
+        );
+
+        vm.stopPrank();
+
+        // Check multi-token weight calculation
+        uint256 weight = enhancedPolls.calculateMultiTokenWeight(voter1, EnhancedPolls.PollCategory.GOVERNANCE);
+        assertEq(weight, 10000); // voter1's governance token balance
+
+        // Vote with multi-token
+        vm.prank(voter1);
+        enhancedPolls.voteMultiToken(pollId, 0);
+
+        // Check results
+        (uint256[] memory votes, uint256 totalVotes, uint256 totalWeight) = enhancedPolls.getPollResults(pollId);
+        assertEq(votes[0], 10000); // voter1's multi-token weight
+        assertEq(totalVotes, 1);
+    }
+
+    function test_RevertInvalidRankedChoices() public {
+        vm.startPrank(owner);
+
+        string[] memory options = new string[](3);
+        options[0] = "A";
+        options[1] = "B";
+        options[2] = "C";
+
+        string[] memory tags = new string[](0);
+
+        uint256 pollId = enhancedPolls.createPoll(
+            "Invalid ranked choice test",
+            options,
+            7 days,
+            EnhancedPolls.PollType.RANKED_CHOICE,
+            EnhancedPolls.PollCategory.GENERAL,
+            0,
+            address(0),
+            0,
+            "Testing invalid ranked choices",
+            tags
+        );
+
+        vm.stopPrank();
+
+        // Try to vote with duplicate choices
+        vm.prank(voter1);
+        uint256[] memory invalidChoices = new uint256[](3);
+        invalidChoices[0] = 0;
+        invalidChoices[1] = 0; // Duplicate!
+        invalidChoices[2] = 2;
+
+        vm.expectRevert(EnhancedPolls.InvalidOption.selector);
+        enhancedPolls.voteRankedChoice(pollId, invalidChoices);
+    }
+
+    function test_RevertInvalidApprovalVoting() public {
+        vm.startPrank(owner);
+
+        string[] memory options = new string[](2);
+        options[0] = "Yes";
+        options[1] = "No";
+
+        string[] memory tags = new string[](0);
+
+        uint256 pollId = enhancedPolls.createPoll(
+            "Invalid approval test",
+            options,
+            7 days,
+            EnhancedPolls.PollType.APPROVAL,
+            EnhancedPolls.PollCategory.GENERAL,
+            0,
+            address(0),
+            0,
+            "Testing invalid approval voting",
+            tags
+        );
+
+        vm.stopPrank();
+
+        // Try to vote with no approvals
+        vm.prank(voter1);
+        bool[] memory noApprovals = new bool[](2);
+        noApprovals[0] = false;
+        noApprovals[1] = false;
+
+        vm.expectRevert(EnhancedPolls.InvalidOption.selector);
+        enhancedPolls.voteApproval(pollId, noApprovals);
+    }
+
+    function test_TimeWeightedVoting() public {
+        vm.startPrank(owner);
+
+        string[] memory options = new string[](2);
+        options[0] = "Yes";
+        options[1] = "No";
+
+        string[] memory tags = new string[](1);
+        tags[0] = "timeweighted";
+
+        uint256 pollId = enhancedPolls.createPoll(
+            "Time-weighted voting test",
+            options,
+            7 days,
+            EnhancedPolls.PollType.TIME_WEIGHTED,
+            EnhancedPolls.PollCategory.GOVERNANCE,
+            0,
+            address(governanceToken),
+            1000 * 1e18,
+            "Testing time-weighted functionality",
+            tags
+        );
+
+        // Set time weight configuration
+        enhancedPolls.setTimeWeightConfig(
+            pollId,
+            1e18, // 1x base multiplier
+            1e17, // 0.1x bonus per day
+            5e18, // 5x max multiplier
+            1 days // 1 day minimum holding time
+        );
+
+        vm.stopPrank();
+
+        // Track token holding for voter1
+        vm.prank(voter1);
+        enhancedPolls.trackTokenHolding(address(governanceToken));
+
+        // Fast forward time to simulate holding
+        vm.warp(block.timestamp + 10 days);
+
+        // Check time weight calculation
+        uint256 timeWeight = enhancedPolls.calculateTimeWeight(voter1, address(governanceToken), pollId);
+        assertEq(timeWeight, 2e18); // 1x base + 10 * 0.1x = 2x
+
+        // Vote with time-weighted system
+        vm.prank(voter1);
+        enhancedPolls.voteTimeWeighted(pollId, 0);
+
+        // Check results - should have enhanced weight due to time holding
+        (uint256[] memory votes, uint256 totalVotes, uint256 totalWeight) = enhancedPolls.getPollResults(pollId);
+        assertEq(totalVotes, 1);
+        assertGt(totalWeight, 10000); // Should be greater than base weight due to time multiplier
+    }
+
+    function test_ReputationBasedVoting() public {
+        vm.startPrank(owner);
+
+        string[] memory options = new string[](2);
+        options[0] = "Yes";
+        options[1] = "No";
+
+        string[] memory tags = new string[](1);
+        tags[0] = "reputation";
+
+        uint256 pollId = enhancedPolls.createPoll(
+            "Reputation-based voting test",
+            options,
+            7 days,
+            EnhancedPolls.PollType.REPUTATION_BASED,
+            EnhancedPolls.PollCategory.GOVERNANCE,
+            0,
+            address(0),
+            0,
+            "Testing reputation-based functionality",
+            tags
+        );
+
+        vm.stopPrank();
+
+        // Check initial reputation
+        (uint256 totalVotes, uint256 pollsCreated, uint256 successfulPolls, 
+         uint256 reputationScore, uint256 lastActivityTime, bool isActive) = 
+            enhancedPolls.getUserReputation(voter1);
+        
+        assertEq(reputationScore, 0); // Initial reputation should be 0
+
+        // Vote to build reputation
+        vm.prank(voter1);
+        enhancedPolls.voteReputationBased(pollId, 0);
+
+        // Check updated reputation
+        (totalVotes, pollsCreated, successfulPolls, reputationScore, lastActivityTime, isActive) = 
+            enhancedPolls.getUserReputation(voter1);
+        
+        assertEq(totalVotes, 1);
+        assertEq(reputationScore, 10); // Should have 10 points for voting
+        assertTrue(isActive);
+
+        // Check reputation voting weight
+        uint256 repWeight = enhancedPolls.calculateReputationVotingWeight(voter1);
+        assertGt(repWeight, 1e18); // Should be greater than base weight
+    }
+
+    function test_RewardSystem() public {
+        vm.startPrank(owner);
+
+        // Fund the reward pool
+        enhancedPolls.fundRewardPool{value: 1 ether}();
+
+        // Activate rewards
+        enhancedPolls.updateRewardPool(30, 70, 3, true); // 30% creator, 70% voter, min 3 votes, active
+
+        string[] memory options = new string[](2);
+        options[0] = "Yes";
+        options[1] = "No";
+
+        string[] memory tags = new string[](1);
+        tags[0] = "rewards";
+
+        uint256 pollId = enhancedPolls.createPoll(
+            "Reward system test",
+            options,
+            7 days,
+            EnhancedPolls.PollType.STANDARD,
+            EnhancedPolls.PollCategory.GENERAL,
+            0,
+            address(0),
+            0,
+            "Testing reward system",
+            tags
+        );
+
+        vm.stopPrank();
+
+        // Get multiple voters to participate
+        vm.prank(voter1);
+        enhancedPolls.vote(pollId, 0);
+
+        vm.prank(voter2);
+        enhancedPolls.vote(pollId, 1);
+
+        vm.prank(voter3);
+        enhancedPolls.vote(pollId, 0);
+
+        // Close the poll
+        vm.prank(owner);
+        enhancedPolls.closePoll(pollId);
+
+        // Distribute rewards
+        enhancedPolls.distributeRewards(pollId);
+
+        // Check creator rewards
+        (uint256 totalEarned, uint256 pendingRewards, uint256 lastClaimTime, uint256 pollsRewarded) = 
+            enhancedPolls.getUserRewards(owner);
+        
+        assertGt(pendingRewards, 0); // Creator should have pending rewards
+        assertEq(pollsRewarded, 1);
+
+        // Test reward claiming
+        uint256 balanceBefore = owner.balance;
+        vm.prank(owner);
+        enhancedPolls.claimRewards();
+        
+        assertGt(owner.balance, balanceBefore); // Balance should increase after claiming
+    }
+
+    function test_TokenHoldingTracking() public {
+        vm.prank(voter1);
+        enhancedPolls.trackTokenHolding(address(governanceToken));
+
+        (uint256 firstSeen, uint256 holdingTime) = enhancedPolls.getUserTokenHoldingTime(voter1, address(governanceToken));
+        assertEq(firstSeen, block.timestamp);
+        assertEq(holdingTime, 0); // Just tracked, so no holding time yet
+
+        // Fast forward time
+        vm.warp(block.timestamp + 5 days);
+
+        (firstSeen, holdingTime) = enhancedPolls.getUserTokenHoldingTime(voter1, address(governanceToken));
+        assertEq(holdingTime, 5 days);
+    }
+
+    function test_ReputationDecay() public {
+        vm.startPrank(owner);
+
+        // Create a poll to build reputation
+        string[] memory options = new string[](2);
+        options[0] = "Yes";
+        options[1] = "No";
+
+        string[] memory tags = new string[](0);
+
+        uint256 pollId = enhancedPolls.createPoll(
+            "Reputation decay test",
+            options,
+            7 days,
+            EnhancedPolls.PollType.REPUTATION_BASED,
+            EnhancedPolls.PollCategory.GENERAL,
+            0,
+            address(0),
+            0,
+            "Testing reputation decay",
+            tags
+        );
+
+        vm.stopPrank();
+
+        // Vote to build reputation
+        vm.prank(voter1);
+        enhancedPolls.voteReputationBased(pollId, 0);
+
+        // Check initial reputation
+        (, , , uint256 initialScore, ,) = enhancedPolls.getUserReputation(voter1);
+        assertEq(initialScore, 10);
+
+        // Fast forward time to test decay
+        vm.warp(block.timestamp + 100 days);
+
+        // Vote again to trigger reputation update with decay
+        vm.startPrank(owner);
+        uint256 pollId2 = enhancedPolls.createPoll(
+            "Second poll",
+            options,
+            7 days,
+            EnhancedPolls.PollType.REPUTATION_BASED,
+            EnhancedPolls.PollCategory.GENERAL,
+            0,
+            address(0),
+            0,
+            "Second poll",
+            tags
+        );
+        vm.stopPrank();
+
+        vm.prank(voter1);
+        enhancedPolls.voteReputationBased(pollId2, 0);
+
+        // Check reputation after decay
+        (, , , uint256 finalScore, ,) = enhancedPolls.getUserReputation(voter1);
+        assertLt(finalScore, initialScore + 10); // Should be less due to decay
+    }
+
+    function test_RewardPoolManagement() public {
+        vm.startPrank(owner);
+
+        // Check initial reward pool state
+        (uint256 totalRewards, uint256 creatorPercentage, uint256 voterPercentage, 
+         uint256 minParticipation, bool isActive) = enhancedPolls.getRewardPoolInfo();
+        
+        assertEq(totalRewards, 0);
+        assertEq(creatorPercentage, 30);
+        assertEq(voterPercentage, 70);
+        assertFalse(isActive);
+
+        // Fund the pool
+        enhancedPolls.fundRewardPool{value: 5 ether}();
+
+        (totalRewards, , , ,) = enhancedPolls.getRewardPoolInfo();
+        assertEq(totalRewards, 5 ether);
+
+        // Update pool settings
+        enhancedPolls.updateRewardPool(40, 60, 10, true);
+
+        (, creatorPercentage, voterPercentage, minParticipation, isActive) = enhancedPolls.getRewardPoolInfo();
+        assertEq(creatorPercentage, 40);
+        assertEq(voterPercentage, 60);
+        assertEq(minParticipation, 10);
+        assertTrue(isActive);
+
+        vm.stopPrank();
+    }
 }
