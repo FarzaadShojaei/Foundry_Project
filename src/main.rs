@@ -19,8 +19,8 @@ abigen!(
         function extendPoll(uint256 _pollId, uint256 _additionalTime) external
         function setDelegate(address _delegate) external
         function removeDelegate() external
-        function getPoll(uint256 _pollId) external view returns (tuple(uint256 id, string question, string[] options, address creator, uint256 createdAt, uint256 endTime, uint8 status, uint8 pollType, uint8 category, uint256 minParticipation, uint256 totalVotes, uint256 totalWeight, string description, string[] tags))
-        function getPollResults(uint256 _pollId) external view returns (uint256[] memory votes, uint256 totalVotes, uint256 totalWeight)
+        function getPoll(uint256 _pollId) external view returns (tuple(uint256 id, string question, string[] options, address creator, uint256 createdAt, uint256 endTime, uint8 status, uint8 pollType, uint8 category, uint256 minParticipation, uint256 totalVotes, uint256 totalWeight, string description, string[] tags, uint256 templateId, bool isArchived, uint256 archivedAt))
+        function getPollResults(uint256 _pollId) external view returns (uint256[] memory, uint256, uint256)
         function getPollsByCategory(uint8 _category) external view returns (uint256[] memory)
         function getPollsByTag(string memory _tag) external view returns (uint256[] memory)
         function getFilteredPolls(uint8 _status, uint8 _category, bool _activeOnly) external view returns (uint256[] memory)
@@ -392,7 +392,7 @@ impl PollManager {
             token_addr,
             U256::from(min_token_balance) * U256::from(10).pow(U256::from(18)), // Convert to wei
             desc,
-            tags_vec,
+            tags_vec.clone(),
         );
 
         let tx = contract_call.send().await?;
@@ -464,13 +464,8 @@ impl PollManager {
         println!("Active: {}", poll_data.6);
 
         // Get results
-        let results = self.contract
+        let (results, total_votes, _total_weight) = self.contract
             .get_poll_results(U256::from(poll_id))
-            .call()
-            .await?;
-
-        let total_votes = self.contract
-            .get_total_votes(U256::from(poll_id))
             .call()
             .await?;
 
@@ -522,13 +517,8 @@ impl PollManager {
             .call()
             .await?;
 
-        let results = self.contract
+        let (results, total_votes, _total_weight) = self.contract
             .get_poll_results(U256::from(poll_id))
-            .call()
-            .await?;
-
-        let total_votes = self.contract
-            .get_total_votes(U256::from(poll_id))
             .call()
             .await?;
 
@@ -630,8 +620,7 @@ impl PollManager {
         println!("{} {} {} {}", "📊 Exporting poll".cyan().bold(), poll_id.to_string().yellow(), "in".cyan().bold(), format.yellow());
 
         let poll_data = self.contract.get_poll(U256::from(poll_id)).call().await?;
-        let results = self.contract.get_poll_results(U256::from(poll_id)).call().await?;
-        let total_votes = self.contract.get_total_votes(U256::from(poll_id)).call().await?;
+        let (results, total_votes, _total_weight) = self.contract.get_poll_results(U256::from(poll_id)).call().await?;
 
         let created_at = DateTime::from_timestamp(poll_data.4.as_u64() as i64, 0)
             .unwrap_or_default()
@@ -650,7 +639,7 @@ impl PollManager {
             creator: format!("{:?}", poll_data.3),
             created_at,
             end_time,
-            is_active: poll_data.6,
+            is_active: poll_data.6 == 0,
             total_votes: total_votes.as_u64(),
             options: poll_data.2.clone(),
             votes: results.iter().map(|v| v.as_u64()).collect(),
@@ -722,8 +711,7 @@ impl PollManager {
 
     async fn generate_single_poll_analytics(&self, poll_id: u64) -> Result<()> {
         let poll_data = self.contract.get_poll(U256::from(poll_id)).call().await?;
-        let results = self.contract.get_poll_results(U256::from(poll_id)).call().await?;
-        let total_votes = self.contract.get_total_votes(U256::from(poll_id)).call().await?;
+        let (results, total_votes, _total_weight) = self.contract.get_poll_results(U256::from(poll_id)).call().await?;
 
         let created_at = DateTime::from_timestamp(poll_data.4.as_u64() as i64, 0)
             .unwrap_or_default()
@@ -767,7 +755,7 @@ impl PollManager {
             0.0
         };
 
-        let time_remaining = if poll_data.6 {
+        let time_remaining = if poll_data.6 == 0 {
             let now = chrono::Utc::now().timestamp() as u64;
             let end_time = poll_data.5.as_u64();
             if end_time > now {
@@ -822,8 +810,8 @@ impl PollManager {
         
         for i in 0..poll_count.as_u64() {
             let poll_data = self.contract.get_poll(U256::from(i)).call().await?;
-            let total_votes = self.contract.get_total_votes(U256::from(i)).call().await?;
-            let is_active = poll_data.6 && chrono::Utc::now().timestamp() as u64 <= poll_data.5.as_u64();
+            let (_, total_votes, _) = self.contract.get_poll_results(U256::from(i)).call().await?;
+            let is_active = poll_data.6 == 0 && chrono::Utc::now().timestamp() as u64 <= poll_data.5.as_u64();
             
             total_system_votes += total_votes.as_u64();
             if is_active {
